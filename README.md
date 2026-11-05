@@ -2,6 +2,10 @@
 
 [中文说明](README_CN.md)
 
+original node from : https://github.com/facok/comfyui-SelfLift
+This  is a revised version which is compatible with latest Pika H3 Lora, especially solving the pika's lcm sampler and mannual sigmas incompatible issue. 
+
+
 Progressive-resolution sampling for ComfyUI: run the early denoising steps at low resolution, lift the result to full resolution, and finish there — faster generation with no training. Based on the [SelfLift paper](https://arxiv.org/abs/2609.02036) (SelfLift-zero) for rectified-flow image models, plus an experimental MiniMax H3 audio-video adaptation that the paper does not validate. Also included: an experimental H3 port of [TST](https://arxiv.org/abs/2609.08505) temporal-attention correction.
 
 All nodes are in the `selflift` category. The samplers use `sampler`/`sigmas` inputs like `SamplerCustom`; connect the standard `euler` sampler from `KSamplerSelect` and the model's normal scheduler (other samplers are rejected).
