@@ -14,6 +14,15 @@ All nodes are in the `selflift` category. The samplers use `sampler`/`sigmas` in
 
 `SelfLift Progressive Sampler (Pika H3 LCM)` is the Pika H3 Flex route. Connect `KSamplerSelect=lcm` and `ManualSigmas` with `1.0, 0.972973, 0.923077, 0.8, 0.571429, 0.333333, 0.0`. The default split is three low-resolution LCM evaluations, H3 latent upscaling at the `0.8` boundary, then three high-resolution LCM evaluations. Use CFG 1.0. Avatar workflows must keep the nested audio latent and use an audio mask of zero.
 
+### Pika H3 Upscale Refine
+
+`SelfLift Pika Upscale Refine (Pika H3 LCM)` keeps Pika's schedule whole: the full LCM schedule runs at the latent size you set upstream (e.g. 1344x768), its clean result is lifted by the H3 latent upscaler (`upscale_by`, e.g. `1.42` for 1920x1088), re-noised at a sigma from the same schedule with the LCM boundary rule, and the remaining steps finish at the lifted size. No VAE input is needed.
+
+- `refine_start_step`: where the high-res pass re-enters the schedule, `sigmas[refine_start_step:]`. With the 6-step Pika schedule, `4` = from `0.571429` (2 high-res steps, default), `3` = from `0.8` (3 steps), `5` = 1 step, `6` = pure lift.
+- `refine_sigmas` (optional): a custom high-res schedule that overrides `refine_start_step` (must start below 1 and end at 0).
+- `keep_base_audio`: output the audio finished in the base pass (default on).
+- Each run logs `[SelfLift upscale plan]` with the base and lifted pixel sizes and the refine sigmas.
+
 ## SelfLift Progressive Sampler (Image)
 
 The paper's SelfLift-zero for rectified-flow image backbones. Connect 4D image latents (e.g. *Empty Latent Image*) and the model's own VAE.

@@ -629,9 +629,232 @@ class SelfLiftH3TST:
         return (h3_tst.patch_model(model, tau, log_diagnostics),)
 
 
+def _masked_model(base, anchor_video, mask, audio_streams, nested, b, c):
+    """Pin the keep-region (mask=0) of the video to its clean anchor via a post-CFG x0 blend."""
+    if mask is None:
+        return base
+    patched = base.clone()
+    if nested:
+        flat_mask = mask.reshape(b, 1, -1).repeat(1, 1, c).to(anchor_video.device)
+        flat_anchor = anchor_video.reshape(b, 1, -1)
+        for s in audio_streams:
+            flat_mask = torch.cat([flat_mask, torch.ones_like(s.reshape(b, 1, -1)).to(flat_mask)], dim=-1)
+            flat_anchor = torch.cat([flat_anchor, s.reshape(b, 1, -1).to(flat_anchor)], dim=-1)
+        hook = _mask_blend_fn(flat_anchor, flat_mask)
+    else:
+        hook = _mask_blend_fn(anchor_video, mask)
+    patched.model_options = comfy.model_patcher.set_model_options_post_cfg_function(patched.model_options, hook)
+    return patched
+
+
+def _validate_refine_sigmas(refine):
+    if refine.ndim != 1 or not refine.is_floating_point() or not torch.isfinite(refine).all():
+        raise ValueError("SelfLift upscale: refine sigmas must be a finite one-dimensional float tensor")
+    if refine.numel() < 2:
+        return
+    if (refine[1:] > refine[:-1]).any() or (refine < 0).any():
+        raise ValueError("SelfLift upscale: refine sigmas must be non-increasing and nonnegative")
+    if refine[0] >= 1:
+        raise ValueError("SelfLift upscale: the refine starting sigma must be below 1 (1 would discard the lifted result)")
+    if refine[-1] != 0:
+        raise ValueError("SelfLift upscale: refine sigmas must end at 0")
+
+
+def upscale_refine_sample(model, positive, negative, latent_image, sampler, sigmas, seed, cfg,
+                          upscale_by, refine_start_step, latent_lifter, model_hires=None,
+                          refine_sigmas=None, keep_base_audio=True):
+    """Pika full-schedule pass at the input size, then a SelfLift lift + re-noise + high-res finish.
+
+    Base pass: the complete LCM schedule runs on the latent exactly as configured upstream.
+    Lift: its clean endpoint z0 is lifted by the learned H3 latent upscaler (the SelfLift
+    direct lift), re-noised at the refine sigma with the LCM boundary rule, and the
+    remaining schedule finishes at the lifted resolution.
+    """
+    if sigmas.ndim != 1 or sigmas.numel() < 2:
+        raise ValueError("SelfLift upscale: sigmas must hold at least one step")
+    if (sigmas[1:] > sigmas[:-1]).any() or sigmas[-1] != 0:
+        raise ValueError("SelfLift upscale: base sigmas must be non-increasing and end at 0")
+    model_sampling = model.get_model_object("model_sampling")
+    _validate_sampling(model_sampling, sampler)
+    if sampler.sampler_function is not comfy.k_diffusion.sampling.sample_lcm:
+        raise ValueError("SelfLift Pika requires the LCM sampler")
+    if not 1.0 <= upscale_by <= 4.0:
+        raise ValueError("SelfLift upscale: upscale_by must be between 1 and 4")
+
+    base_steps = sigmas.numel() - 1
+    if refine_sigmas is not None:
+        refine = refine_sigmas.flatten().float().to(sigmas.device)
+    else:
+        if not 0 <= refine_start_step <= base_steps:
+            raise ValueError(f"SelfLift upscale: refine_start_step must be within 0..{base_steps} for this schedule")
+        refine = sigmas[refine_start_step:] if refine_start_step < base_steps else sigmas[-1:]
+    _validate_refine_sigmas(refine)
+    refine_steps = refine.numel() - 1
+
+    noise_mask = _validate_latent_input(latent_image)
+    streams, nested = _streams(comfy.sample.fix_empty_latent_channels(
+        model, latent_image["samples"], latent_image.get("downscale_ratio_spacial", None),
+        latent_image.get("downscale_ratio_temporal", None)))
+    if streams[0].ndim != 5:
+        raise ValueError("SelfLift upscale: expected a MiniMax H3 video latent")
+    b, c, t, H, W = streams[0].shape
+    H2 = max(2, round(H * upscale_by / 2) * 2)
+    W2 = max(2, round(W * upscale_by / 2) * 2)
+    latent_format = model.get_model_object("latent_format")
+    ratio = getattr(latent_format, "spacial_downscale_ratio", 1)
+    logging.info("[SelfLift upscale plan] base_latent=%s pixels=%s base_nfe=%d -> lift_latent=(%d, %d) pixels=(%d, %d) "
+                 "spatial_lift=(%.4f, %.4f) refine_nfe=%d refine_sigmas=%s keep_base_audio=%s mask=%s hires_model=%s",
+                 tuple(streams[0].shape), (H * ratio, W * ratio), base_steps, H2, W2, H2 * ratio, W2 * ratio,
+                 H2 / H, W2 / W, refine_steps, [round(float(s), 6) for s in refine],
+                 keep_base_audio, "none" if noise_mask is None else tuple(noise_mask.shape),
+                 "custom" if model_hires is not None else "same")
+
+    device = comfy.model_management.intermediate_device()
+    source_video = streams[0].to(device)
+    audio_streams = [s.to(device) for s in streams[1:]]
+    m_base = m_high = None
+    if noise_mask is not None:
+        m_base = noise_mask.expand(b, 1, t, H, W) if noise_mask.shape[2] == 1 and t > 1 else noise_mask
+        m_high = torch.nn.functional.interpolate(
+            m_base.reshape(b * t, 1, H, W).float(), size=(H2, W2), mode="bilinear", align_corners=False
+        ).reshape(b, 1, t, H2, W2).clamp(0.0, 1.0)
+
+    # ---- base pass: full Pika schedule at the configured size ----
+    base_latent = _pack([source_video] + audio_streams, nested)
+    base_model = _masked_model(model, source_video, m_base, audio_streams, nested, b, c)
+    noise = comfy.sample.prepare_noise(base_latent, seed, latent_image.get("batch_index", None))
+    disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+    callback_base = latent_preview.prepare_callback(model, base_steps)
+    base_timer = _StageTimer("base", model.load_device, (H, W), ratio)
+    base_count = [0]
+
+    def cb_base(step, x0, x, total):
+        base_count[0] += 1
+        result = callback_base(step, x0, x, total)
+        base_timer.mark(f"step {base_count[0]}/{base_steps}" + (" (includes setup)" if base_count[0] == 1 else ""))
+        return result
+
+    base_out = comfy.samplers.sample(base_model, noise, positive, negative, cfg, model.load_device,
+                                     sampler, sigmas, base_model.model_options,
+                                     latent_image=base_latent, callback=cb_base,
+                                     disable_pbar=disable_pbar, seed=seed)
+    base_timer.finish()
+    del noise, base_latent, base_model
+    log_memory("base end", model.load_device)
+
+    # ---- SelfLift transition: lift the clean endpoint, re-noise at the refine sigma ----
+    transition_timer = _StageTimer("transition", model.load_device, (H2, W2), ratio)
+    base_out_streams, _ = _streams(base_out)       # VAE space
+    base_audio_vae = [s.to(device) for s in base_out_streams[1:]]
+    z0_low_vae = base_out_streams[0].float().to(device)
+    z0_high_vae = latent_lifter(z0_low_vae, (H2, W2)).float().to(device)
+    if m_high is not None:
+        # keep-region comes from the original content, lifted the same way
+        keep_high = latent_lifter(source_video.float(), (H2, W2)).float().to(device)
+        mh = m_high.to(z0_high_vae)
+        z0_high_vae = z0_high_vae * mh + keep_high * (1.0 - mh)
+        del keep_high
+    transition_timer.mark("lift")
+
+    if refine_steps == 0:
+        transition_timer.finish()
+        out_streams = [z0_high_vae] + base_audio_vae
+    else:
+        in_streams, _ = _streams(model.model.process_latent_in(base_out))  # model space
+        z0_high = latent_format.process_in(z0_high_vae)
+        sigma_r = refine[0]
+        v_noise = comfy.sample.prepare_noise(z0_high, (seed + 1) % (1 << 64),
+                                             latent_image.get("batch_index", None)).to(z0_high)
+        next_streams = [model_sampling.noise_scaling(sigma_r, v_noise, z0_high)]
+        for index, a in enumerate(in_streams[1:]):
+            a = a.to(device)
+            a_noise = comfy.sample.prepare_noise(a, (seed + 1000 + index) % (1 << 64),
+                                                 latent_image.get("batch_index", None)).to(a)
+            next_streams.append(model_sampling.noise_scaling(sigma_r, a_noise, a))
+        resume_streams = [model_sampling.inverse_noise_scaling(sigma_r, s) for s in next_streams]
+        resume_latent = model.model.process_latent_out(_pack(resume_streams, nested))
+        resume_noise = _pack([torch.zeros_like(s) for s in resume_streams], nested)
+        audio_anchor = [a.to(device) for a in in_streams[1:]]
+        del v_noise, next_streams, resume_streams, in_streams
+        transition_timer.mark("renoise")
+        transition_timer.finish()
+
+        hires_base = model_hires if model_hires is not None else model
+        high_model = _masked_model(hires_base, z0_high, m_high, audio_anchor, nested, b, c)
+        positive_high = _resize_keyframes(positive, H2, W2)
+        negative_high = _resize_keyframes(negative, H2, W2)
+        callback_high = latent_preview.prepare_callback(model, refine_steps)
+        high_timer = _StageTimer("high_resolution", model.load_device, (H2, W2), ratio)
+        high_count = [0]
+
+        def cb_high(step, x0, x, total):
+            high_count[0] += 1
+            result = callback_high(step, x0, x, total)
+            high_timer.mark(f"step {high_count[0]}/{refine_steps}" + (" (includes setup)" if high_count[0] == 1 else ""))
+            return result
+
+        high_out = comfy.samplers.sample(high_model, resume_noise, positive_high, negative_high, cfg, model.load_device,
+                                         sampler, refine, high_model.model_options,
+                                         latent_image=resume_latent, callback=cb_high,
+                                         disable_pbar=disable_pbar, seed=seed)
+        high_timer.finish()
+        del resume_latent, resume_noise, z0_high, audio_anchor
+        out_streams, _ = _streams(high_out)
+        out_streams = list(out_streams)
+        if keep_base_audio and base_audio_vae:
+            out_streams = [out_streams[0]] + [a.to(out_streams[0].device) for a in base_audio_vae]
+
+    result = latent_image.copy()
+    result.pop("noise_mask", None)
+    result["samples"] = _pack(out_streams, nested).to(device=comfy.model_management.intermediate_device(),
+                                                      dtype=comfy.model_management.intermediate_dtype())
+    log_memory("upscale refine end", model.load_device)
+    return result
+
+
+class SelfLiftPikaUpscaleRefine:
+    """Run Pika's full LCM schedule at the configured size, then SelfLift-upscale and finish at high resolution."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "positive": ("CONDITIONING",),
+            "negative": ("CONDITIONING",),
+            "latent_image": ("LATENT", {"tooltip": "Base-size H3 AV latent (e.g. 768p). The full Pika schedule runs at this size."}),
+            "sampler": ("SAMPLER", {"tooltip": "Connect KSamplerSelect set to lcm."}),
+            "sigmas": ("SIGMAS", {"tooltip": "Full Pika H3 schedule for the base pass: 1, 0.972973, 0.923077, 0.8, 0.571429, 0.333333, 0."}),
+            "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
+            "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+            "upscale_by": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 4.0, "step": 0.01, "tooltip": "Spatial lift factor after the base pass. Latent size is rounded to even; the exact output size is logged in [SelfLift upscale plan]."}),
+            "refine_start_step": ("INT", {"default": 4, "min": 0, "max": 64, "tooltip": "Where the high-res finish re-enters the base schedule: sigmas[refine_start_step:]. With Pika's 6-step schedule: 4 = from 0.571 (2 steps), 3 = from 0.8 (3 steps), 5 = from 0.333 (1 step), 6 = pure lift (0 steps). Ignored when refine_sigmas is connected."}),
+            "upscaler_model": _upscaler_input(),
+        }, "optional": {
+            "model_hires": ("MODEL", {"tooltip": "Optional model for the high-resolution finish."}),
+            "refine_sigmas": ("SIGMAS", {"tooltip": "Optional custom high-res schedule (must start below 1 and end at 0). Overrides refine_start_step."}),
+            "keep_base_audio": ("BOOLEAN", {"default": True, "tooltip": "Output the audio finished in the base pass instead of the re-noised high-res audio."}),
+            "upscaler_unload": ("BOOLEAN", {"default": True}),
+        }}
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+    CATEGORY = "selflift"
+
+    def sample(self, model, positive, negative, latent_image, sampler, sigmas, seed, cfg,
+               upscale_by, refine_start_step, upscaler_model, model_hires=None, refine_sigmas=None,
+               keep_base_audio=True, upscaler_unload=True):
+        if upscaler_model == "none":
+            raise ValueError("SelfLift Pika upscale requires an H3 latent upscaler model")
+        lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model, force_unload=upscaler_unload)
+        return (upscale_refine_sample(model, positive, negative, latent_image, sampler, sigmas, seed, cfg,
+                                      upscale_by, refine_start_step, lifter, model_hires=model_hires,
+                                      refine_sigmas=refine_sigmas, keep_base_audio=keep_base_audio),)
+
+
 NODE_CLASS_MAPPINGS = {
     "SelfLiftH3Sampler": SelfLiftH3Sampler,
     "SelfLiftPikaH3Sampler": SelfLiftPikaH3Sampler,
+    "SelfLiftPikaUpscaleRefine": SelfLiftPikaUpscaleRefine,
     "SelfLiftImageSampler": SelfLiftImageSampler,
     "SelfLiftH3TST": SelfLiftH3TST,
 }
@@ -639,6 +862,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SelfLiftH3Sampler": "SelfLift Progressive Sampler (MiniMax H3)",
     "SelfLiftPikaH3Sampler": "SelfLift Progressive Sampler (Pika H3 LCM)",
+    "SelfLiftPikaUpscaleRefine": "SelfLift Pika Upscale Refine (Pika H3 LCM)",
     "SelfLiftImageSampler": "SelfLift Progressive Sampler (Image)",
     "SelfLiftH3TST": "H3 Temporal State Transport (TST)",
 }

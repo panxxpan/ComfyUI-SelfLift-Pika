@@ -10,6 +10,15 @@ ComfyUI 渐进分辨率采样：前期去噪步骤跑低分辨率，把结果提
 
 新增 `SelfLift Progressive Sampler (Pika H3 LCM)`，专门接 Pika H3 Flex。连接 `KSamplerSelect=lcm` 和 `ManualSigmas`，推荐 sigma 为 `1.0, 0.972973, 0.923077, 0.8, 0.571429, 0.333333, 0.0`，`transition_step=3`，`lowres_scale=0.5`，CFG 使用 `1.0`。节点在低分辨率执行前三个 LCM 评估，使用 H3 latent upscaler 提升 video latent，再从 `sigma=0.8` 继续后三个 LCM 评估。Avatar 输入必须保留 nested audio latent，并将 audio mask 设为 0。
 
+### Pika H3 放大精修节点
+
+`SelfLift Pika Upscale Refine (Pika H3 LCM)` 不拆分 Pika 的步数：先在上游设定的尺寸（如 1344x768）完整跑完 LCM 调度，再用 H3 latent upscaler 把干净结果放大 `upscale_by` 倍（如 `1.42` 得到 1920x1088），按同一调度中的某个 sigma 以 LCM 边界规则重新加噪，最后在放大后的尺寸跑完剩余步数。不需要接 VAE。
+
+- `refine_start_step`：高清段从调度的哪个位置重新进入，即 `sigmas[refine_start_step:]`。官方 6 步调度下：`4` = 从 `0.571429` 开始跑 2 步（默认），`3` = 从 `0.8` 开始跑 3 步，`5` = 跑 1 步，`6` = 纯放大不精修。
+- `refine_sigmas`（可选）：自定义高清段调度，接入后覆盖 `refine_start_step`（首值须小于 1，末值为 0）。
+- `keep_base_audio`：输出基础段跑完的音频（默认开启）。
+- 每次运行会在日志打印 `[SelfLift upscale plan]`，包含基础尺寸、放大后尺寸和高清段 sigma。
+
 ## SelfLift Progressive Sampler (Image)
 
 论文 SelfLift-zero，用于 rectified-flow 图像骨干。接入 4D 图像 latent（如 *Empty Latent Image*）和模型所属 VAE。
