@@ -25,7 +25,9 @@ import comfy.model_sampling
 import comfy.nested_tensor
 import comfy.sample
 import comfy.samplers
+import comfy.sd
 import comfy.utils
+import folder_paths
 import latent_preview
 
 from . import selflift
@@ -660,9 +662,78 @@ def _validate_refine_sigmas(refine):
         raise ValueError("SelfLift upscale: refine sigmas must end at 0")
 
 
+_HIRES_LORA_NONE = "None"
+_HIRES_LORA_PREFIX = "hires_lora_"
+
+
+class _FlexibleOptional(dict):
+    """Optional-input dict that also accepts the extra LoRA slots the frontend adds."""
+
+    def __contains__(self, key):
+        return super().__contains__(key) or _hires_lora_slot(key) is not None
+
+    def __getitem__(self, key):
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        slot = _hires_lora_slot(key)
+        if slot is None:
+            raise KeyError(key)
+        return _hires_lora_input_types()[slot[1]]
+
+
+def _hires_lora_slot(key):
+    """'hires_lora_3' -> (3, 'name'), 'hires_lora_3_strength' -> (3, 'strength'), else None."""
+    if not isinstance(key, str) or not key.startswith(_HIRES_LORA_PREFIX):
+        return None
+    rest = key[len(_HIRES_LORA_PREFIX):]
+    kind = "name"
+    if rest.endswith("_strength"):
+        rest, kind = rest[:-len("_strength")], "strength"
+    return (int(rest), kind) if rest.isdigit() and int(rest) >= 1 else None
+
+
+def _hires_lora_input_types():
+    return {
+        "name": ([_HIRES_LORA_NONE] + folder_paths.get_filename_list("loras"), {
+            "default": _HIRES_LORA_NONE,
+            "tooltip": "H3 LoRA applied only to the high-resolution refine steps (face fix, cinematic look, detail). "
+                       "Pick one and a new empty slot appears below."}),
+        "strength": ("FLOAT", {"default": 0.5, "min": -10.0, "max": 10.0, "step": 0.01,
+                               "tooltip": "LoRA strength for the refine steps. Start around 0.3-0.6 on few-step Pika."}),
+    }
+
+
+def _collect_hires_loras(kwargs):
+    """Gather (slot, name, strength) from hires_lora_N / hires_lora_N_strength inputs, in slot order."""
+    slots = {}
+    for key, value in kwargs.items():
+        slot = _hires_lora_slot(key)
+        if slot is not None:
+            slots.setdefault(slot[0], {})[slot[1]] = value
+    loras = []
+    for index in sorted(slots):
+        name = slots[index].get("name", _HIRES_LORA_NONE)
+        strength = float(slots[index].get("strength", 0.5))
+        if name in (None, "", _HIRES_LORA_NONE) or strength == 0.0:
+            continue
+        loras.append((index, name, strength))
+    return loras
+
+
+def _apply_hires_loras(model, loras):
+    """Return a clone of `model` with the LoRAs patched in; the base model is left untouched."""
+    for index, name, strength in loras:
+        path = folder_paths.get_full_path_or_raise("loras", name)
+        lora = comfy.utils.load_torch_file(path, safe_load=True)
+        model, _ = comfy.sd.load_lora_for_models(model, None, lora, strength, 0)
+        del lora
+        logging.info("[SelfLift hires LoRA] slot %d: %s strength=%.3f", index, name, strength)
+    return model
+
+
 def upscale_refine_sample(model, positive, negative, latent_image, sampler, sigmas, seed, cfg,
                           upscale_by, refine_start_step, latent_lifter, model_hires=None,
-                          refine_sigmas=None, keep_base_audio=True):
+                          refine_sigmas=None, keep_base_audio=True, hires_loras=()):
     """Pika full-schedule pass at the input size, then a SelfLift lift + re-noise + high-res finish.
 
     Base pass: the complete LCM schedule runs on the latent exactly as configured upstream.
@@ -703,11 +774,14 @@ def upscale_refine_sample(model, positive, negative, latent_image, sampler, sigm
     latent_format = model.get_model_object("latent_format")
     ratio = getattr(latent_format, "spacial_downscale_ratio", 1)
     logging.info("[SelfLift upscale plan] base_latent=%s pixels=%s base_nfe=%d -> lift_latent=(%d, %d) pixels=(%d, %d) "
-                 "spatial_lift=(%.4f, %.4f) refine_nfe=%d refine_sigmas=%s keep_base_audio=%s mask=%s hires_model=%s",
+                 "spatial_lift=(%.4f, %.4f) refine_nfe=%d refine_sigmas=%s keep_base_audio=%s mask=%s hires_model=%s hires_loras=%s",
                  tuple(streams[0].shape), (H * ratio, W * ratio), base_steps, H2, W2, H2 * ratio, W2 * ratio,
                  H2 / H, W2 / W, refine_steps, [round(float(s), 6) for s in refine],
                  keep_base_audio, "none" if noise_mask is None else tuple(noise_mask.shape),
-                 "custom" if model_hires is not None else "same")
+                 "custom" if model_hires is not None else "same",
+                 [f"{name}@{strength:g}" for _, name, strength in hires_loras] or "none")
+    if hires_loras and refine_steps == 0:
+        logging.warning("[SelfLift hires LoRA] refine_steps=0 (pure lift): the high-res LoRAs have nothing to act on")
 
     device = comfy.model_management.intermediate_device()
     source_video = streams[0].to(device)
@@ -780,6 +854,8 @@ def upscale_refine_sample(model, positive, negative, latent_image, sampler, sigm
         transition_timer.finish()
 
         hires_base = model_hires if model_hires is not None else model
+        if hires_loras:
+            hires_base = _apply_hires_loras(hires_base, hires_loras)
         high_model = _masked_model(hires_base, z0_high, m_high, audio_anchor, nested, b, c)
         positive_high = _resize_keyframes(positive, H2, W2)
         negative_high = _resize_keyframes(negative, H2, W2)
@@ -817,6 +893,15 @@ class SelfLiftPikaUpscaleRefine:
 
     @classmethod
     def INPUT_TYPES(cls):
+        lora_types = _hires_lora_input_types()
+        optional = _FlexibleOptional({
+            "model_hires": ("MODEL", {"tooltip": "Optional model for the high-resolution finish."}),
+            "refine_sigmas": ("SIGMAS", {"tooltip": "Optional custom high-res schedule (must start below 1 and end at 0). Overrides refine_start_step."}),
+            "keep_base_audio": ("BOOLEAN", {"default": True, "tooltip": "Output the audio finished in the base pass instead of the re-noised high-res audio."}),
+            "upscaler_unload": ("BOOLEAN", {"default": True}),
+            "hires_lora_1": lora_types["name"],
+            "hires_lora_1_strength": lora_types["strength"],
+        })
         return {"required": {
             "model": ("MODEL",),
             "positive": ("CONDITIONING",),
@@ -829,12 +914,7 @@ class SelfLiftPikaUpscaleRefine:
             "upscale_by": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 4.0, "step": 0.01, "tooltip": "Spatial lift factor after the base pass. Latent size is rounded to even; the exact output size is logged in [SelfLift upscale plan]."}),
             "refine_start_step": ("INT", {"default": 4, "min": 0, "max": 64, "tooltip": "Where the high-res finish re-enters the base schedule: sigmas[refine_start_step:]. With Pika's 6-step schedule: 4 = from 0.571 (2 steps), 3 = from 0.8 (3 steps), 5 = from 0.333 (1 step), 6 = pure lift (0 steps). Ignored when refine_sigmas is connected."}),
             "upscaler_model": _upscaler_input(),
-        }, "optional": {
-            "model_hires": ("MODEL", {"tooltip": "Optional model for the high-resolution finish."}),
-            "refine_sigmas": ("SIGMAS", {"tooltip": "Optional custom high-res schedule (must start below 1 and end at 0). Overrides refine_start_step."}),
-            "keep_base_audio": ("BOOLEAN", {"default": True, "tooltip": "Output the audio finished in the base pass instead of the re-noised high-res audio."}),
-            "upscaler_unload": ("BOOLEAN", {"default": True}),
-        }}
+        }, "optional": optional}
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"
@@ -842,13 +922,14 @@ class SelfLiftPikaUpscaleRefine:
 
     def sample(self, model, positive, negative, latent_image, sampler, sigmas, seed, cfg,
                upscale_by, refine_start_step, upscaler_model, model_hires=None, refine_sigmas=None,
-               keep_base_audio=True, upscaler_unload=True):
+               keep_base_audio=True, upscaler_unload=True, **kwargs):
         if upscaler_model == "none":
             raise ValueError("SelfLift Pika upscale requires an H3 latent upscaler model")
         lifter = lambda z, hw: h3_upscaler.learned_latent_lift(z, hw, upscaler_model, force_unload=upscaler_unload)
         return (upscale_refine_sample(model, positive, negative, latent_image, sampler, sigmas, seed, cfg,
                                       upscale_by, refine_start_step, lifter, model_hires=model_hires,
-                                      refine_sigmas=refine_sigmas, keep_base_audio=keep_base_audio),)
+                                      refine_sigmas=refine_sigmas, keep_base_audio=keep_base_audio,
+                                      hires_loras=_collect_hires_loras(kwargs)),)
 
 
 NODE_CLASS_MAPPINGS = {

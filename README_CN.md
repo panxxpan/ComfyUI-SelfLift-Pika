@@ -17,6 +17,7 @@ ComfyUI 渐进分辨率采样：前期去噪步骤跑低分辨率，把结果提
 - `refine_start_step`：高清段从调度的哪个位置重新进入，即 `sigmas[refine_start_step:]`。官方 6 步调度下：`4` = 从 `0.571429` 开始跑 2 步（默认），`3` = 从 `0.8` 开始跑 3 步，`5` = 跑 1 步，`6` = 纯放大不精修。
 - `refine_sigmas`（可选）：自定义高清段调度，接入后覆盖 `refine_start_step`（首值须小于 1，末值为 0）。
 - `keep_base_audio`：输出基础段跑完的音频（默认开启）。
+- `hires_lora_1` / `hires_lora_1_strength`：只在高清精修步骤挂载的 H3 LoRA（修脸、电影感、细节），Pika 基础段不受影响。选中一个 LoRA 后下方会自动出现新的空槽位，可叠加任意多个。强度建议从 0.3～0.6 起试；想要效果更明显，把 `refine_start_step` 调到 3。
 - 每次运行会在日志打印 `[SelfLift upscale plan]`，包含基础尺寸、放大后尺寸和高清段 sigma。
 
 ## SelfLift Progressive Sampler (Image)

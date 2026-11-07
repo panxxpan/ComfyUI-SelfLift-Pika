@@ -21,6 +21,7 @@ All nodes are in the `selflift` category. The samplers use `sampler`/`sigmas` in
 - `refine_start_step`: where the high-res pass re-enters the schedule, `sigmas[refine_start_step:]`. With the 6-step Pika schedule, `4` = from `0.571429` (2 high-res steps, default), `3` = from `0.8` (3 steps), `5` = 1 step, `6` = pure lift.
 - `refine_sigmas` (optional): a custom high-res schedule that overrides `refine_start_step` (must start below 1 and end at 0).
 - `keep_base_audio`: output the audio finished in the base pass (default on).
+- `hires_lora_1` / `hires_lora_1_strength`: H3 LoRAs (face fix, cinematic look, detail) applied only to the high-res refine steps; the base Pika pass is untouched. Pick a LoRA and a new empty slot appears below, so any number can be stacked. Start around 0.3-0.6. Set `refine_start_step` to 3 for a stronger effect.
 - Each run logs `[SelfLift upscale plan]` with the base and lifted pixel sizes and the refine sigmas.
 
 ## SelfLift Progressive Sampler (Image)
